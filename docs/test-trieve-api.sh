@@ -321,6 +321,90 @@ EOF
     echo ""
 }
 
+# Function to test RAG completion (LLM-generated answers)
+test_rag_completion() {
+    echo "=== Testing RAG Completion ==="
+
+    QUERY="$1"
+    print_info "Question: \"$QUERY\""
+
+    RESPONSE=$(curl -s -w "\n%{http_code}" -X POST "$API_ENDPOINT/chunk/generate" \
+        -H "Authorization: Bearer $API_KEY" \
+        -H "TR-Dataset: $TEST_TRACKING_ID" \
+        -H "Content-Type: application/json" \
+        -H "X-API-Version: v2" \
+        -d @- << EOF
+{
+  "query": "$QUERY",
+  "search_type": "hybrid",
+  "page_size": 5,
+  "score_threshold": 0.25,
+  "llm_options": {
+    "model": "gpt-3.5-turbo",
+    "temperature": 0.1,
+    "max_tokens": 500,
+    "system_message": "You are an expert maintenance technician. Answer based only on the provided manual context. Be specific and actionable."
+  },
+  "highlight_results": true
+}
+EOF
+)
+
+    HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+    BODY=$(echo "$RESPONSE" | head -n -1)
+
+    if [ "$HTTP_CODE" == "200" ]; then
+        print_success "RAG completion successful"
+        
+        COMPLETION=$(echo "$BODY" | jq -r '.completion // "No completion generated"')
+        CHUNK_COUNT=$(echo "$BODY" | jq '.chunks | length // 0')
+        
+        echo ""
+        echo "Generated Answer:"
+        echo "=================="
+        echo "$COMPLETION" | fold -w 80 -s
+        echo ""
+        print_info "Answer based on $CHUNK_COUNT source chunks"
+    else
+        print_error "RAG completion failed (HTTP $HTTP_CODE)"
+        echo "$BODY" | jq .
+        
+        # Don't exit on RAG failure - endpoint might not be available
+        print_info "RAG completion endpoint may not be available in this Trieve version"
+    fi
+    echo ""
+}
+
+# Function to test file deletion
+test_delete_file() {
+    echo "=== Testing File Deletion ==="
+
+    if [ -z "$FILE_ID" ]; then
+        print_error "No FILE_ID available for deletion test"
+        return
+    fi
+
+    print_info "Deleting file: $FILE_ID"
+
+    RESPONSE=$(curl -s -w "\n%{http_code}" -X DELETE "$API_ENDPOINT/file/$FILE_ID" \
+        -H "Authorization: Bearer $API_KEY" \
+        -H "TR-Dataset: $TEST_TRACKING_ID" \
+        -H "X-API-Version: v2")
+
+    HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+    BODY=$(echo "$RESPONSE" | head -n -1)
+
+    if [ "$HTTP_CODE" == "204" ] || [ "$HTTP_CODE" == "200" ]; then
+        print_success "File deleted successfully"
+    else
+        print_error "File deletion failed (HTTP $HTTP_CODE)"
+        if [ -n "$BODY" ]; then
+            echo "$BODY" | jq . 2>/dev/null || echo "$BODY"
+        fi
+    fi
+    echo ""
+}
+
 # Function to cleanup
 cleanup() {
     echo "=== Cleaning Up ==="
@@ -359,8 +443,15 @@ main() {
 
     # Run multiple searches
     search_chunks "pump seals"
-    search_chunks "maintenance"
+    search_chunks "maintenance" 
     search_chunks "pressure"
+
+    # Test RAG completion (LLM-generated answers)
+    test_rag_completion "How do I maintain pump seals?"
+    test_rag_completion "What should I do if pressure drops?"
+
+    # Test file deletion
+    test_delete_file
 
     cleanup
 

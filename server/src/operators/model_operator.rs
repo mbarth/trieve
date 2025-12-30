@@ -16,6 +16,18 @@ use std::{collections::HashMap, io::Cursor, ops::IndexMut, sync::Arc};
 
 use super::parse_operator::convert_html_to_text;
 
+/// Determine the correct embedding endpoint URL and request format based on the base URL
+fn build_embedding_endpoint_and_format(base_url: &str) -> (String, bool) {
+    // Check if this looks like an Ollama server
+    if base_url.contains("11434") || base_url.contains("ollama") {
+        // Ollama format: http://localhost:11434/api/embeddings
+        (format!("{}/api/embeddings", base_url.trim_end_matches('/')), true)
+    } else {
+        // OpenAI format: https://api.openai.com/v1/embeddings?api-version=2023-05-15
+        (format!("{}/embeddings?api-version=2023-05-15", base_url.trim_end_matches('/')), false)
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct EmbeddingParameters {
     /// Input text to embed, encoded as a string or array of tokens. To embed multiple inputs in a single request, pass an array of strings or array of token arrays.
@@ -49,6 +61,19 @@ impl DenseEmbedData {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct EmbeddingInner {
+    embedding: Vec<f32>,
+}
+
+/// Ollama embedding request format
+#[derive(Debug, Serialize, Deserialize)]
+struct OllamaEmbeddingRequest {
+    model: String,
+    prompt: String,
+}
+
+/// Ollama embedding response format
+#[derive(Debug, Serialize, Deserialize)]
+struct OllamaEmbeddingResponse {
     embedding: Vec<f32>,
 }
 
@@ -121,6 +146,9 @@ pub async fn get_dense_vector(
         let mut retries = 0;
         let mut embedding_resp: Option<DenseEmbedData> = None;
         let mut embedding_error = None;
+        
+        let (endpoint_url, is_ollama) = build_embedding_endpoint_and_format(&embedding_base_url);
+        
         while retries < 3 {
             let embeddings_resp_a = ureq::AgentBuilder::new()
                 .tls_connector(Arc::new(native_tls::TlsConnector::new().map_err(|_| {
@@ -130,17 +158,46 @@ pub async fn get_dense_vector(
                 })?))
                 .timeout(std::time::Duration::from_secs(5))
                 .build()
-                .post(&format!(
-                    "{}/embeddings?api-version=2023-05-15",
-                    embedding_base_url
-                ))
-                .set("Authorization", &format!("Bearer {}", &embedding_api_key))
-                .set("api-key", &embedding_api_key)
-                .set("Content-Type", "application/json")
-                .send_json(serde_json::to_value(parameters.clone()).unwrap());
+                .post(&endpoint_url);
+            
+            let embeddings_resp_a = if is_ollama {
+                // Handle Ollama format - single prompt only
+                let prompt = if let EmbeddingInput::StringArray(ref strings) = parameters.input {
+                    strings.first().unwrap_or(&String::new()).clone()
+                } else {
+                    String::new()
+                };
+                
+                let ollama_request = OllamaEmbeddingRequest {
+                    model: parameters.model.clone(),
+                    prompt,
+                };
+                
+                embeddings_resp_a
+                    .set("Content-Type", "application/json")
+                    .send_json(serde_json::to_value(ollama_request).unwrap())
+            } else {
+                // Handle OpenAI format
+                embeddings_resp_a
+                    .set("Authorization", &format!("Bearer {}", &embedding_api_key))
+                    .set("api-key", &embedding_api_key)
+                    .set("Content-Type", "application/json")
+                    .send_json(serde_json::to_value(parameters.clone()).unwrap())
+            };
 
-            if let Ok(embeddings_resp_a) = embeddings_resp_a {
-                let response_data = embeddings_resp_a.into_json::<DenseEmbedData>();
+            if let Ok(embeddings_resp_raw) = embeddings_resp_a {
+                let response_data = if is_ollama {
+                    // Parse Ollama response and convert to OpenAI format
+                    embeddings_resp_raw.into_json::<OllamaEmbeddingResponse>()
+                        .map(|ollama_resp| DenseEmbedData {
+                            data: vec![EmbeddingInner { embedding: ollama_resp.embedding }],
+                            usage: EmbeddingUsage { prompt_tokens: 0, total_tokens: 0 },
+                        })
+                } else {
+                    // Parse OpenAI response directly
+                    embeddings_resp_raw.into_json::<DenseEmbedData>()
+                };
+                
                 if let Ok(embeddings_resp) = response_data {
                     embedding_resp = Some(embeddings_resp);
                     break;
@@ -438,23 +495,66 @@ pub async fn get_dense_vectors(
             let embedding_api_key = embedding_api_key.clone();
 
             async move {
-                let embeddings_resp = cur_client
-                    .post(format!("{}/embeddings?api-version=2023-05-15", url))
-                    .header("Authorization", &format!("Bearer {}", &embedding_api_key.clone()))
-                    .header("api-key", &embedding_api_key.clone())
-                    .header("Content-Type", "application/json")
-                    .timeout(std::time::Duration::from_secs(90))
-                    .json(&parameters)
-                    .send()
-                    .await
-                    .map_err(|_| {
-                        ServiceError::BadRequest("Failed to send message to embedding server".to_string())
-                    })?
-                    .json::<DenseEmbedData>()
-                    .await
-                    .map_err(|err| {
-                        ServiceError::BadRequest(format!("Failed to format text from embeddings {}", err))
-                    })?;
+                let (endpoint_url, is_ollama) = build_embedding_endpoint_and_format(&url);
+                
+                let embeddings_resp = if is_ollama {
+                    // Handle Ollama format - process each input separately
+                    let mut all_embeddings = Vec::new();
+                    let inputs: Vec<String> = match &parameters.input {
+                        EmbeddingInput::String(s) => vec![s.clone()],
+                        EmbeddingInput::StringArray(arr) => arr.clone(),
+                        _ => return Err(ServiceError::BadRequest("Unsupported input format".to_string())),
+                    };
+                    
+                    for input_text in inputs {
+                        let ollama_req = OllamaEmbeddingRequest {
+                            model: parameters.model.clone(),
+                            prompt: input_text,
+                        };
+                        
+                        let response = cur_client
+                            .post(&endpoint_url)
+                            .header("Content-Type", "application/json")
+                            .timeout(std::time::Duration::from_secs(90))
+                            .json(&ollama_req)
+                            .send()
+                            .await
+                            .map_err(|_| {
+                                ServiceError::BadRequest("Failed to send message to Ollama embedding server".to_string())
+                            })?
+                            .json::<OllamaEmbeddingResponse>()
+                            .await
+                            .map_err(|err| {
+                                ServiceError::BadRequest(format!("Failed to parse Ollama embedding response: {}", err))
+                            })?;
+                        
+                        all_embeddings.push(EmbeddingInner { embedding: response.embedding });
+                    }
+                    
+                    DenseEmbedData {
+                        data: all_embeddings,
+                        usage: EmbeddingUsage { prompt_tokens: 0, total_tokens: 0 },
+                    }
+                } else {
+                    // Handle OpenAI format
+                    cur_client
+                        .post(endpoint_url)
+                        .header("Authorization", &format!("Bearer {}", &embedding_api_key.clone()))
+                        .header("api-key", &embedding_api_key.clone())
+                        .header("Content-Type", "application/json")
+                        .timeout(std::time::Duration::from_secs(90))
+                        .json(&parameters)
+                        .send()
+                        .await
+                        .map_err(|_| {
+                            ServiceError::BadRequest("Failed to send message to embedding server".to_string())
+                        })?
+                        .json::<DenseEmbedData>()
+                        .await
+                        .map_err(|err| {
+                            ServiceError::BadRequest(format!("Failed to format text from embeddings {}", err))
+                        })?
+                };
 
                 let vectors_and_boosts: Vec<(Vec<f32>, &(usize, SemanticBoost))> = embeddings_resp
                     .to_vec()
@@ -505,30 +605,73 @@ pub async fn get_dense_vectors(
             let embedding_api_key = embedding_api_key.clone();
 
             async move {
-                let embeddings_resp = cur_client
-                    .post(format!("{}/embeddings?api-version=2023-05-15", url))
-                    .header(
-                        "Authorization",
-                        &format!("Bearer {}", &embedding_api_key.clone()),
-                    )
-                    .header("api-key", &embedding_api_key.clone())
-                    .header("Content-Type", "application/json")
-                    .json(&parameters)
-                    .send()
-                    .await
-                    .map_err(|_| {
-                        ServiceError::BadRequest(
-                            "Failed to send message to embedding server".to_string(),
+                let (endpoint_url, is_ollama) = build_embedding_endpoint_and_format(&url);
+                
+                let embeddings_resp = if is_ollama {
+                    // Handle Ollama format - process each input separately
+                    let mut all_embeddings = Vec::new();
+                    let inputs: Vec<String> = match &parameters.input {
+                        EmbeddingInput::String(s) => vec![s.clone()],
+                        EmbeddingInput::StringArray(arr) => arr.clone(),
+                        _ => return Err(ServiceError::BadRequest("Unsupported input format".to_string())),
+                    };
+                    
+                    for input_text in inputs {
+                        let ollama_req = OllamaEmbeddingRequest {
+                            model: parameters.model.clone(),
+                            prompt: input_text,
+                        };
+                        
+                        let response = cur_client
+                            .post(&endpoint_url)
+                            .header("Content-Type", "application/json")
+                            .timeout(std::time::Duration::from_secs(90))
+                            .json(&ollama_req)
+                            .send()
+                            .await
+                            .map_err(|_| {
+                                ServiceError::BadRequest("Failed to send message to Ollama embedding server".to_string())
+                            })?
+                            .json::<OllamaEmbeddingResponse>()
+                            .await
+                            .map_err(|err| {
+                                ServiceError::BadRequest(format!("Failed to parse Ollama embedding response: {}", err))
+                            })?;
+                        
+                        all_embeddings.push(EmbeddingInner { embedding: response.embedding });
+                    }
+                    
+                    DenseEmbedData {
+                        data: all_embeddings,
+                        usage: EmbeddingUsage { prompt_tokens: 0, total_tokens: 0 },
+                    }
+                } else {
+                    // Handle OpenAI format
+                    cur_client
+                        .post(endpoint_url)
+                        .header(
+                            "Authorization",
+                            &format!("Bearer {}", &embedding_api_key.clone()),
                         )
-                    })?
-                    .json::<DenseEmbedData>()
-                    .await
-                    .map_err(|err| {
-                        ServiceError::BadRequest(format!(
-                            "Failed to get text from embeddings {:?}",
-                            err
-                        ))
-                    })?;
+                        .header("api-key", &embedding_api_key.clone())
+                        .header("Content-Type", "application/json")
+                        .json(&parameters)
+                        .send()
+                        .await
+                        .map_err(|_| {
+                            ServiceError::BadRequest(
+                                "Failed to send message to embedding server".to_string(),
+                            )
+                        })?
+                        .json::<DenseEmbedData>()
+                        .await
+                        .map_err(|err| {
+                            ServiceError::BadRequest(format!(
+                                "Failed to get text from embeddings {:?}",
+                                err
+                            ))
+                        })?
+                };
 
                 let vectors: Vec<Vec<f32>> = embeddings_resp.to_vec();
 

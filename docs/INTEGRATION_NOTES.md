@@ -229,6 +229,52 @@ Body: {
 
 ### ✅ Response Parsing
 
+### ✅ RAG Completion (LLM Answers)
+
+**New Implementation:**
+```rust
+POST /api/chunk/generate
+Headers:
+  - Authorization: Bearer {API_KEY}
+  - TR-Dataset: {DATASET_ID}
+  - X-API-Version: v2
+Body: {
+  "query": "How to maintain pump seals?",
+  "search_type": "hybrid",
+  "page_size": 5,
+  "score_threshold": 0.25,
+  "llm_options": {
+    "model": "gpt-3.5-turbo",
+    "temperature": 0.1,
+    "max_tokens": 1000,
+    "system_message": "You are an expert maintenance technician..."
+  }
+}
+```
+
+**Verdict:** ✅ **NEW FUNCTIONALITY ADDED**
+
+This provides the same user experience as AnythingLLM - ask a question, get a formatted answer.
+
+**Response Format:**
+```json
+{
+  "completion": "To maintain pump seals, follow these steps...",
+  "chunks": [
+    {
+      "chunk": { "chunk_html": "...", "metadata": {...} },
+      "score": 0.87
+    }
+  ]
+}
+```
+
+**Benefits:**
+- Complete answers ready for users
+- Sources included for verification
+- Customizable LLM behavior
+- Consistent with AnythingLLM experience
+
 **Expected Response Structure:**
 
 The response structure depends on API version:

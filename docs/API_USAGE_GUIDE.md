@@ -382,15 +382,31 @@ DELETE /api/file/{file_id}
 ```http
 Authorization: Bearer tr_your_api_key
 TR-Dataset: dataset-uuid-or-tracking-id
+X-API-Version: v2
 ```
+
+**Path Parameters:**
+- `file_id` **(required)**: The UUID of the file to delete (from upload response)
 
 **Response:** `204 No Content`
 
-**Note**: Deleting a file also deletes all associated chunks.
+**Important Notes:**
+- Deleting a file also deletes all associated chunks automatically
+- You must store the `file_id` from the upload response to enable deletion
+- The file_id is a UUID, not the filename
+
+**Example:**
+```bash
+# Delete a file using the file_id from upload
+curl -X DELETE "http://localhost:8090/api/file/123e4567-e89b-12d3-a456-426614174000" \
+  -H "Authorization: Bearer tr_your_api_key" \
+  -H "TR-Dataset: device-pump-001" \
+  -H "X-API-Version: v2"
+```
 
 ### Search Operations
 
-#### Semantic Search
+#### Semantic Search (Raw Results)
 
 ```http
 POST /api/chunk/search
@@ -516,6 +532,81 @@ X-API-Version: v2
 - Higher scores = more relevant (for cosine similarity)
 - Score range: 0.0 to 1.0 for cosine distance
 - Recommendation: Filter results with `score_threshold` >= 0.25
+
+#### RAG Completion (LLM-Generated Answers)
+
+For getting complete answers instead of raw chunks (similar to AnythingLLM):
+
+```http
+POST /api/chunk/generate
+```
+
+**Headers:**
+```http
+Authorization: Bearer tr_your_api_key
+TR-Dataset: dataset-uuid-or-tracking-id
+Content-Type: application/json
+X-API-Version: v2
+```
+
+**Request Body:**
+```json
+{
+  "query": "How do I maintain pump seals?",
+  "search_type": "hybrid",
+  "page_size": 5,
+  "score_threshold": 0.25,
+  "llm_options": {
+    "model": "gpt-3.5-turbo",
+    "temperature": 0.1,
+    "max_tokens": 1000,
+    "system_message": "You are an expert industrial equipment maintenance technician. Answer questions based only on the provided equipment manual context. Be specific and actionable."
+  },
+  "highlight_results": true
+}
+```
+
+**Field Descriptions:**
+
+- `query` **(required)**: The question to ask
+- `search_type` **(required)**: Same as search endpoint (`"hybrid"` recommended)
+- `page_size` (optional, default: 10): Number of chunks to include in LLM context
+- `score_threshold` (optional): Filter chunks before sending to LLM
+- `llm_options` **(required)**: LLM configuration
+  - `model`: LLM model to use (e.g., "gpt-3.5-turbo", "gpt-4")
+  - `temperature`: Creativity level (0.0-1.0, recommend 0.1 for factual answers)
+  - `max_tokens`: Maximum response length
+  - `system_message`: Instructions for the LLM
+- `highlight_results` (optional, default: false): Return highlighted chunks
+
+**Response:**
+```json
+{
+  "completion": "To maintain pump seals, follow these steps:\n\n1. Turn off the pump and relieve all pressure in the system\n2. Remove the seal housing carefully to avoid damage\n3. Inspect the seals for signs of wear, cracking, or deterioration\n4. Clean the seal housing thoroughly\n5. Install new seals using proper lubricant\n6. Reassemble following torque specifications\n\nRegular seal inspection should be performed every 3 months or 500 operating hours, whichever comes first.",
+  "chunks": [
+    {
+      "chunk": {
+        "id": "chunk-uuid",
+        "chunk_html": "Pump seal maintenance procedures...",
+        "metadata": {"device_id": "pump-001"},
+        "tag_set": ["device:pump-001", "maintenance"]
+      },
+      "score": 0.89
+    }
+  ]
+}
+```
+
+**Key Benefits:**
+- **Complete answers**: Get formatted responses ready for users
+- **Contextual**: LLM answers based on relevant manual content
+- **Customizable**: Control LLM behavior with system messages
+- **Sources included**: See which chunks informed the answer
+
+**Use Cases:**
+- **User-facing chat**: Direct answers for equipment operators
+- **Technical support**: Detailed maintenance instructions
+- **Troubleshooting**: Step-by-step problem resolution
 
 ### Chunk Management
 
